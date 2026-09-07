@@ -1,5 +1,21 @@
 import React, { useState, useEffect, useRef, useCallback } from "react";
 import { createRoot } from "react-dom/client";
+import { createClient } from "@supabase/supabase-js";
+
+/* Supabase config. Baked in at build time from .env (see build.mjs); can also be
+   entered at runtime in the Tests tab, which stores it in localStorage. */
+const ENV_SUPABASE_URL = process.env.SUPABASE_URL || "";
+const ENV_SUPABASE_KEY = process.env.SUPABASE_ANON_KEY || "";
+const CFG_KEY = "threshold-log-supabase";
+const loadCfg = () => {
+  try {
+    const raw = window.localStorage.getItem(CFG_KEY);
+    if (raw) return JSON.parse(raw);
+  } catch (e) {
+    /* fall through to env */
+  }
+  return { url: ENV_SUPABASE_URL, key: ENV_SUPABASE_KEY };
+};
 
 /* ------------------------------------------------------------------ */
 /*  Palette + type                                                     */
@@ -454,17 +470,171 @@ function ThresholdLog() {
     }
   };
 
+  /* ---------------- Supabase sync ----------------
+     Local-first. localStorage is the cache; the cloud row is the source of
+     truth across devices. Whole-document, last-write-wins by updatedAt. */
+  const [cfg, setCfg] = useState(loadCfg);
+  const [cfgDraft, setCfgDraft] = useState({ url: "", key: "" });
+  const supa = useRef(null);
+  const [session, setSession] = useState(null);
+  const [sync, setSync] = useState({ status: "off", at: null, why: null });
+  const [email, setEmail] = useState("");
+  const [code, setCode] = useState("");
+  const [authMsg, setAuthMsg] = useState("");
+  const pushRef = useRef(null);
+  const sessionRef = useRef(null);
+  sessionRef.current = session;
+
+  useEffect(() => {
+    if (!cfg.url || !cfg.key) {
+      supa.current = null;
+      setSession(null);
+      setSync({ status: "off", at: null, why: null });
+      return;
+    }
+    let client;
+    try {
+      client = createClient(cfg.url, cfg.key);
+    } catch (e) {
+      setSync({ status: "error", at: null, why: "Bad Supabase URL or key." });
+      return;
+    }
+    supa.current = client;
+    setSync({ status: "signedout", at: null, why: null });
+    client.auth.getSession().then(({ data }) => setSession(data.session));
+    const { data: sub } = client.auth.onAuthStateChange((_evt, s) => setSession(s));
+    return () => sub.subscription.unsubscribe();
+  }, [cfg.url, cfg.key]);
+
+  const push = async () => {
+    const c = supa.current;
+    const s = sessionRef.current;
+    if (!c || !s) return;
+    setSync((v) => ({ ...v, status: "syncing" }));
+    const { error } = await c.from("training_logs").upsert({
+      user_id: s.user.id,
+      data: latest.current,
+      updated_at: new Date().toISOString(),
+    });
+    if (error)
+      setSync({
+        status: navigator.onLine === false ? "offline" : "error",
+        at: null,
+        why: error.message,
+      });
+    else setSync({ status: "synced", at: Date.now(), why: null });
+  };
+
+  const pull = async () => {
+    const c = supa.current;
+    const s = sessionRef.current;
+    if (!c || !s) return;
+    setSync((v) => ({ ...v, status: "syncing" }));
+    const { data, error } = await c
+      .from("training_logs")
+      .select("data")
+      .eq("user_id", s.user.id)
+      .maybeSingle();
+    if (error) {
+      setSync({ status: "error", at: null, why: error.message });
+      return;
+    }
+    const remote = data && data.data;
+    const localAt = latest.current.updatedAt || 0;
+    const remoteAt = (remote && remote.updatedAt) || 0;
+    if (remote && remoteAt > localAt) {
+      const merged = { ...BLANK, ...remote };
+      setState(merged);
+      latest.current = merged;
+      writeLocal(merged);
+      setSync({ status: "synced", at: Date.now(), why: null });
+    } else if (localAt > remoteAt) {
+      await push();
+    } else {
+      setSync({ status: "synced", at: Date.now(), why: null });
+    }
+  };
+
+  useEffect(() => {
+    if (session) pull();
+    else if (supa.current) setSync({ status: "signedout", at: null, why: null });
+  }, [session]);
+
+  /* retry a push when the network comes back */
+  useEffect(() => {
+    const onUp = () => {
+      if (sessionRef.current) push();
+    };
+    window.addEventListener("online", onUp);
+    return () => window.removeEventListener("online", onUp);
+  }, []);
+
+  const sendCode = async () => {
+    if (!supa.current || !email) return;
+    setAuthMsg("Sending…");
+    const { error } = await supa.current.auth.signInWithOtp({
+      email: email.trim(),
+      options: { emailRedirectTo: window.location.href.split("#")[0] },
+    });
+    setAuthMsg(
+      error
+        ? error.message
+        : "Check your email. Tap the link, or paste the code below."
+    );
+  };
+
+  const verifyCode = async () => {
+    if (!supa.current || !email || !code) return;
+    setAuthMsg("Verifying…");
+    const { error } = await supa.current.auth.verifyOtp({
+      email: email.trim(),
+      token: code.trim(),
+      type: "email",
+    });
+    setAuthMsg(error ? error.message : "");
+    if (!error) setCode("");
+  };
+
+  const signOut = async () => {
+    if (supa.current) await supa.current.auth.signOut();
+  };
+
+  const saveCfg = () => {
+    const next = { url: cfgDraft.url.trim(), key: cfgDraft.key.trim() };
+    try {
+      window.localStorage.setItem(CFG_KEY, JSON.stringify(next));
+    } catch (e) {
+      /* runs from memory this session */
+    }
+    setCfg(next);
+  };
+
+  const clearCfg = () => {
+    try {
+      window.localStorage.removeItem(CFG_KEY);
+    } catch (e) {
+      /* ignore */
+    }
+    setCfg({ url: ENV_SUPABASE_URL, key: ENV_SUPABASE_KEY });
+  };
+
   const persist = useCallback((next) => {
-    setState(next);
-    latest.current = next;
+    const stamped = { ...next, updatedAt: Date.now() };
+    setState(stamped);
+    latest.current = stamped;
     setDirty(true);
     clearTimeout(saveRef.current);
-    saveRef.current = setTimeout(() => writeLocal(next), 300);
+    saveRef.current = setTimeout(() => writeLocal(stamped), 300);
+    clearTimeout(pushRef.current);
+    pushRef.current = setTimeout(() => push(), 1500);
   }, []);
 
   /* write immediately when the tab goes to the background */
   useEffect(() => {
-    const bail = () => writeLocal(latest.current);
+    const bail = () => {
+      writeLocal(latest.current);
+      if (sessionRef.current) push();
+    };
     window.addEventListener("pagehide", bail);
     document.addEventListener("visibilitychange", () => {
       if (document.visibilityState === "hidden") bail();
@@ -626,21 +796,40 @@ function ThresholdLog() {
           <Eyebrow>{stepDays} step days</Eyebrow>
         </div>
         {(() => {
-          const color = !store.ok ? C.rust : store.at ? C.green : C.dim;
-          const text = !store.ok
+          const t = (ms) =>
+            new Date(ms).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+          const localColor = !store.ok ? C.rust : store.at ? C.green : C.dim;
+          const localText = !store.ok
             ? store.why
             : store.at
-            ? `Saved ${new Date(store.at).toLocaleTimeString([], {
-                hour: "numeric",
-                minute: "2-digit",
-              })}`
+            ? `Saved ${t(store.at)}`
             : "Nothing logged yet";
+          const cloud = {
+            off: [C.dim, "Cloud: not connected"],
+            signedout: [C.amber, "Cloud: sign in to sync"],
+            syncing: [C.muted, "Cloud: syncing…"],
+            synced: [C.green, sync.at ? `Cloud: synced ${t(sync.at)}` : "Cloud: synced"],
+            offline: [C.amber, "Cloud: offline, will retry"],
+            error: [C.rust, `Cloud: ${sync.why || "error"}`],
+          }[sync.status] || [C.dim, ""];
           return (
-            <div className="flex items-center justify-between mt-2">
-              <div style={{ color, fontFamily: MONO, fontSize: 11 }}>{text}</div>
-              <Btn tone={!store.ok || (dirty && !backedUpAt) ? "solid" : "ghost"} onClick={downloadBackup}>
-                Save file
-              </Btn>
+            <div className="mt-2">
+              <div className="flex items-center justify-between">
+                <div style={{ color: localColor, fontFamily: MONO, fontSize: 11 }}>
+                  {localText}
+                </div>
+                <Btn
+                  tone={!store.ok || (dirty && !backedUpAt) ? "solid" : "ghost"}
+                  onClick={downloadBackup}
+                >
+                  Save file
+                </Btn>
+              </div>
+              <div
+                style={{ color: cloud[0], fontFamily: MONO, fontSize: 11, marginTop: 4 }}
+              >
+                {cloud[1]}
+              </div>
             </div>
           );
         })()}
@@ -1076,6 +1265,89 @@ function ThresholdLog() {
           </div>
           <div
             className="mt-8 rounded p-3"
+            style={{ background: C.panel, border: `1px solid ${C.line}` }}
+          >
+            <Eyebrow color={C.amber}>Cloud sync</Eyebrow>
+
+            {!cfg.url || !cfg.key ? (
+              <div>
+                <div style={{ fontSize: 12, color: C.muted, marginTop: 6, lineHeight: 1.4 }}>
+                  Connect a Supabase project to sync between devices. Project URL
+                  and anon key from Settings → API. They're safe to keep here;
+                  row-level security is what protects your data.
+                </div>
+                <div className="mt-3 space-y-2">
+                  <Field
+                    value={cfgDraft.url}
+                    onChange={(v) => setCfgDraft({ ...cfgDraft, url: v })}
+                    placeholder="https://xxxx.supabase.co"
+                  />
+                  <Field
+                    value={cfgDraft.key}
+                    onChange={(v) => setCfgDraft({ ...cfgDraft, key: v })}
+                    placeholder="anon public key"
+                  />
+                  <Btn tone="solid" onClick={saveCfg}>
+                    Connect
+                  </Btn>
+                </div>
+              </div>
+            ) : !session ? (
+              <div>
+                <div style={{ fontSize: 12, color: C.muted, marginTop: 6, lineHeight: 1.4 }}>
+                  Sign in with your email. No password — you get a link and a code.
+                </div>
+                <div className="mt-3 space-y-2">
+                  <Field
+                    value={email}
+                    onChange={setEmail}
+                    placeholder="you@example.com"
+                    mono={false}
+                  />
+                  <Btn tone="solid" onClick={sendCode}>
+                    Send code
+                  </Btn>
+                  <div className="flex gap-2">
+                    <Field
+                      wide={false}
+                      value={code}
+                      onChange={setCode}
+                      placeholder="123456"
+                    />
+                    <Btn onClick={verifyCode}>Verify</Btn>
+                  </div>
+                  {authMsg && (
+                    <div style={{ fontSize: 12, color: C.muted, lineHeight: 1.4 }}>
+                      {authMsg}
+                    </div>
+                  )}
+                  <button
+                    onClick={clearCfg}
+                    style={{ fontFamily: MONO, fontSize: 10, color: C.dim, marginTop: 4 }}
+                  >
+                    DISCONNECT PROJECT
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <div>
+                <div style={{ fontSize: 13, marginTop: 6 }}>{session.user.email}</div>
+                <div style={{ fontSize: 12, color: C.muted, marginTop: 2, lineHeight: 1.4 }}>
+                  Every change pushes to the cloud a second or two after you make
+                  it. Opening the app on another device pulls the latest copy.
+                </div>
+                <div className="flex gap-2 mt-3">
+                  <Btn tone="solid" onClick={pull}>
+                    Sync now
+                  </Btn>
+                  <Btn onClick={signOut}>Sign out</Btn>
+                </div>
+              </div>
+            )}
+          </div>
+
+          <div
+            className="mt-4 rounded p-3"
             style={{ background: C.panel, border: `1px solid ${C.line}` }}
           >
             <Eyebrow>Backup</Eyebrow>
